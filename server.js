@@ -1,5 +1,5 @@
 import fastify from "fastify";
-import fastifyStatic from "@fastify/static";
+//import fastifyStatic from "@fastify/static";
 import path from "path";
 import { fileURLToPath } from "url";
 import { AsyncDatabase } from "promised-sqlite3";
