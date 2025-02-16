@@ -154,5 +154,6 @@ POST /api/contact
 - ✅ Admin dashboard for order management.
 - ✅ WebSocket integration for real-time order status updates.
 
-
+---
+👨‍💻 **Developed by [Lokeshwar Reddy Karra](https://github.com/lokeshkarra)**
 
