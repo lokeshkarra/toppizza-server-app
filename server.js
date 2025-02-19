@@ -1,8 +1,13 @@
 import fastify from "fastify";
-//import fastifyStatic from "@fastify/static";
+
 import path from "path";
 import { fileURLToPath } from "url";
 import { AsyncDatabase } from "promised-sqlite3";
+import crypto from "crypto";
+import cron from "node-cron";
+import axios from "axios";
+
+
 
 const server = fastify({
   logger: {
@@ -20,6 +25,38 @@ const __dirname = path.dirname(__filename);
 
 const db = await AsyncDatabase.open("./pizza.sqlite");
 
+// Cron job to log a message every 10 minutes
+cron.schedule("*/10 * * * *", async () => {
+  console.log(`[CRON JOB] Running at ${new Date().toLocaleString()}`);
+
+  try {
+    // Ping your own API to prevent cold start
+    const apiUrl = "https://toppizza-server-app.onrender.com/api/health"; // Change to your actual API
+    await axios.get(apiUrl);
+    console.log("[CRON JOB] Pinged API to prevent cold start.");
+  } catch (error) {
+    console.error("[CRON JOB] Failed to ping API:", error.message);
+  }
+});
+
+
+cron.schedule("0 0 * * *", async () => {
+  console.log(`[CRON JOB] Deleting old orders at ${new Date().toLocaleString()}`);
+
+  try {
+    const deleteQuery = `
+      DELETE FROM orders 
+      WHERE date < date('now', '-30 days')
+    `;
+    
+    await db.run(deleteQuery);
+    console.log("[CRON JOB] Successfully deleted orders older than 30 days.");
+  } catch (error) {
+    console.error("[CRON JOB] Failed to delete old orders:", error.message);
+  }
+});
+
+
 server.addHook("preHandler", (req, res, done) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST");
@@ -30,6 +67,11 @@ server.addHook("preHandler", (req, res, done) => {
     return res.send();
   }
   done();
+});
+
+// Simple health check endpoint (add inside the routes section)
+server.get("/api/health", async (req, res) => {
+  res.send({ status: "OK", time: new Date().toLocaleString() });
 });
 
 server.get("/api/pizzas", async function getPizzas(req, res) {
@@ -108,80 +150,132 @@ server.get("/api/pizza-of-the-day", async function getPizzaOfTheDay(req, res) {
   res.send(responsePizza);
 });
 
+
+
+
+// Function to generate a unique user ID
+const generateUserId = () => crypto.randomUUID();
+
+/**
+ * GET all orders for a specific user
+ */
 server.get("/api/orders", async function getOrders(req, res) {
-  const id = req.query.id;
-  const orders = await db.all("SELECT order_id, date, time FROM orders");
+  try {
+    const userId = req.headers["x-user-id"];
+    if (!userId) {
+      return res.status(400).send({ error: "User ID required" });
+    }
 
-  res.send(orders);
+    const orders = await db.all(
+      "SELECT order_id, date, time FROM orders WHERE user_id = ? ORDER BY order_id DESC",
+      [userId]
+    );
+
+    res.send(orders);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ error: "Failed to fetch orders" });
+  }
 });
 
-server.get("/api/order", async function getOrders(req, res) {
-  const id = req.query.id;
-  const orderPromise = db.get(
-    "SELECT order_id, date, time FROM orders WHERE order_id = ?",
-    [id]
-  );
-  const orderItemsPromise = db.all(
-    `SELECT 
-      t.pizza_type_id as pizzaTypeId, t.name, t.category, t.ingredients as description, o.quantity, p.price, o.quantity * p.price as total, p.size
-    FROM 
-      order_details o
-    JOIN
-      pizzas p
-    ON
-      o.pizza_id = p.pizza_id
-    JOIN
-      pizza_types t
-    ON
-      p.pizza_type_id = t.pizza_type_id
-    WHERE 
-      order_id = ?`,
-    [id]
-  );
+/**
+ * GET details of a specific order (with order items)
+ */
+server.get("/api/order", async function getOrder(req, res) {
+  try {
+    const userId = req.headers["x-user-id"];
+    const id = req.query.id;
 
-  const [order, orderItemsRes] = await Promise.all([
-    orderPromise,
-    orderItemsPromise,
-  ]);
+    if (!userId) {
+      return res.status(400).send({ error: "User ID required" });
+    }
+    if (!id) {
+      return res.status(400).send({ error: "Order ID required" });
+    }
 
-  const orderItems = orderItemsRes.map((item) =>
-    Object.assign({}, item, {
-      image: `/pizzas/${item.pizzaTypeId}.webp`,
-      quantity: +item.quantity,
-      price: +item.price,
-    })
-  );
+    const orderPromise = db.get(
+      "SELECT order_id, date, time FROM orders WHERE order_id = ? AND user_id = ?",
+      [id, userId]
+    );
 
-  const total = orderItems.reduce((acc, item) => acc + item.total, 0);
+    const orderItemsPromise = db.all(
+      `SELECT 
+        t.pizza_type_id as pizzaTypeId, 
+        t.name, 
+        t.category, 
+        t.ingredients as description, 
+        o.quantity, 
+        p.price, 
+        o.quantity * p.price as total, 
+        p.size
+      FROM 
+        order_details o
+      JOIN pizzas p ON o.pizza_id = p.pizza_id
+      JOIN pizza_types t ON p.pizza_type_id = t.pizza_type_id
+      WHERE 
+        o.order_id = ?`,
+      [id]
+    );
 
-  res.send({
-    order: Object.assign({ total }, order),
-    orderItems,
-  });
+    const [order, orderItemsRes] = await Promise.all([
+      orderPromise,
+      orderItemsPromise,
+    ]);
+
+    if (!order) {
+      return res.status(404).send({ error: "Order not found or unauthorized" });
+    }
+
+    const orderItems = orderItemsRes.map((item) =>
+      Object.assign({}, item, {
+        image: `/pizzas/${item.pizzaTypeId}.webp`,
+        quantity: +item.quantity,
+        price: +item.price,
+      })
+    );
+
+    const total = orderItems.reduce((acc, item) => acc + item.total, 0);
+
+    res.send({
+      order: Object.assign({ total }, order),
+      orderItems,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ error: "Failed to fetch order details" });
+  }
 });
 
+/**
+ * POST Create a new order with user_id
+ */
 server.post("/api/order", async function createOrder(req, res) {
   const { cart } = req.body;
+  let userId = req.headers["x-user-id"];
+
+  if (!userId) {
+    userId = generateUserId(); // Generate user ID if missing
+  }
 
   const now = new Date();
-  // forgive me Date gods, for I have sinned
   const time = now.toLocaleTimeString("en-US", { hour12: false });
   const date = now.toISOString().split("T")[0];
 
   if (!cart || !Array.isArray(cart) || cart.length === 0) {
-    res.status(400).send({ error: "Invalid order data" });
-    return;
+    return res.status(400).send({ error: "Invalid order data" });
   }
 
   try {
     await db.run("BEGIN TRANSACTION");
 
+    // Insert the new order with user_id
     const result = await db.run(
-      "INSERT INTO orders (date, time) VALUES (?, ?)",
-      [date, time]
+      "INSERT INTO orders (date, time, user_id) VALUES (?, ?, ?)",
+      [date, time, userId]
     );
     const orderId = result.lastID;
 
+    // Process cart items
     const mergedCart = cart.reduce((acc, item) => {
       const id = item.pizza.id;
       const size = item.size.toLowerCase();
@@ -199,6 +293,7 @@ server.post("/api/order", async function createOrder(req, res) {
       return acc;
     }, {});
 
+    // Insert order details
     for (const item of Object.values(mergedCart)) {
       const { pizzaId, quantity } = item;
       await db.run(
@@ -209,42 +304,54 @@ server.post("/api/order", async function createOrder(req, res) {
 
     await db.run("COMMIT");
 
-    res.send({ orderId });
+    res.send({ orderId, userId });
   } catch (error) {
-    req.log.error(error);
+    console.error(error);
     await db.run("ROLLBACK");
     res.status(500).send({ error: "Failed to create order" });
   }
 });
 
+
 server.get("/api/past-orders", async function getPastOrders(req, res) {
   try {
+    const userId = req.headers["x-user-id"];
+    if (!userId) {
+      return res.status(400).send({ error: "User ID required" });
+    }
+
     const page = parseInt(req.query.page, 10) || 1;
     const limit = 20;
     const offset = (page - 1) * limit;
+
     const pastOrders = await db.all(
-      "SELECT order_id, date, time FROM orders ORDER BY order_id DESC LIMIT 10 OFFSET ?",
-      [offset]
+      "SELECT order_id, date, time FROM orders WHERE user_id = ? ORDER BY order_id DESC LIMIT ? OFFSET ?",
+      [userId, limit, offset]
     );
+
     res.send(pastOrders);
   } catch (error) {
-    req.log.error(error);
+    console.error(error);
     res.status(500).send({ error: "Failed to fetch past orders" });
   }
 });
 
 server.get("/api/past-order/:order_id", async function getPastOrder(req, res) {
   const orderId = req.params.order_id;
+  const userId = req.headers["x-user-id"];
+
+  if (!userId) {
+    return res.status(400).send({ error: "User ID required" });
+  }
 
   try {
     const order = await db.get(
-      "SELECT order_id, date, time FROM orders WHERE order_id = ?",
-      [orderId]
+      "SELECT order_id, date, time FROM orders WHERE order_id = ? AND user_id = ?",
+      [orderId, userId]
     );
 
     if (!order) {
-      res.status(404).send({ error: "Order not found" });
-      return;
+      return res.status(404).send({ error: "Order not found or unauthorized" });
     }
 
     const orderItems = await db.all(
@@ -283,10 +390,14 @@ server.get("/api/past-order/:order_id", async function getPastOrder(req, res) {
       orderItems: formattedOrderItems,
     });
   } catch (error) {
-    req.log.error(error);
+    console.error(error);
     res.status(500).send({ error: "Failed to fetch order" });
   }
 });
+
+
+
+
 
 server.post("/api/contact", async function contactForm(req, res) {
   const { name, email, message } = req.body;
@@ -316,3 +427,10 @@ const start = async () => {
 };
 
 start();
+
+
+
+
+// Run the cron job every day at midnight (00:00)
+
+
